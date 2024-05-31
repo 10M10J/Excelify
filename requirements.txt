@@ -7,6 +7,5 @@ groq==0.4.0
 tabula-py
 tabula
 tesseract
-tesseract-ocr
 pytesseract
 openpyxl
