@@ -3,6 +3,7 @@ import time
 import json
 import tempfile
 import streamlit as st
+import re
 from dotenv import load_dotenv
 from openai import OpenAI
 from PyPDF2 import PdfReader
@@ -56,16 +57,26 @@ def extract_text_from_image(file):
 def chat_with_mistral(text, selected_fields, model="mistral-small-latest"):
     prompt = f"""
     Extract the following fields from the provided invoice/bill text: {', '.join(selected_fields)}.
-    Respond ONLY in strict JSON array of objects where each object represents one invoice.
+
+    Respond ONLY with valid JSON.
+    - Do not add explanations or extra text.
+    - Do not wrap in Markdown fences.
+    - Return an array of JSON objects, even if only one invoice is found.
+
     Example format:
     [
       {{
         "Invoice Number": "12345",
         "Invoice Date": "2024-01-15",
         "Company Name": "ABC Ltd",
-        ...
+        "Company GST Number": "22ABCDE1234F1Z5",
+        "Customer Name": "XYZ Pvt Ltd",
+        "Customer GST Number": "27XYZDE6789F1Z5",
+        "Total Quantity": "10",
+        "Total Amount": "15000"
       }}
     ]
+
     Text to extract from:
     {text}
     """
@@ -79,21 +90,26 @@ def chat_with_mistral(text, selected_fields, model="mistral-small-latest"):
     return completion.choices[0].message.content
 
 def parse_response_to_table(response, selected_fields):
+    # Try JSON parsing first
     try:
-        data = json.loads(response)
+        # Remove code fences if present
+        response_clean = re.sub(r"^```json|```$", "", response.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(response_clean)
+
         if isinstance(data, dict):
-            data = [data]
+            data = [data]  # wrap single object in list
         df = pd.DataFrame(data)
+        return df
     except Exception:
-        st.warning("Failed to parse JSON properly, falling back to raw text parsing.")
+        st.warning("⚠️ Failed to parse JSON. Falling back to raw text parsing.")
+        # Fallback: try to interpret as Markdown-like table
         lines = response.split("\n")
         rows = []
         for line in lines[1:]:
             parts = [p.strip() for p in line.split("|") if p.strip()]
             if len(parts) == len(selected_fields):
                 rows.append(dict(zip(selected_fields, parts)))
-        df = pd.DataFrame(rows)
-    return df
+        return pd.DataFrame(rows)
 
 def save_file(df, file_format="excel"):
     if file_format == "excel":
