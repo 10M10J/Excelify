@@ -1,156 +1,164 @@
+import os
 import time
+import json
+import tempfile
 import streamlit as st
 from dotenv import load_dotenv
-import os
-from groq import Groq
+from openai import OpenAI
 from PyPDF2 import PdfReader
+from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image
 import pandas as pd
-import tabula 
 
 # Load environment variables
 load_dotenv()
-groq_api_key = os.getenv('GROQ_API_KEY')
+mistral_api_key = os.getenv("MISTRAL_API_KEY")
 
 # Check if the API key is set
-if not groq_api_key:
-    st.error("GROQ API key not found in environment variables.")
+if not mistral_api_key:
+    st.error("Mistral API key not found in environment variables.")
     st.stop()
 
-# Create a Groq client
-client = Groq(api_key=groq_api_key)
+# Initialize Mistral client
+client = OpenAI(api_key=mistral_api_key, base_url="https://api.mistral.ai/v1")
 
-# File upload and processing function
-def process_file(file):
-    file_name, file_extension = os.path.splitext(file.name)
-    ext_text = ""
-    if file_extension.lower() == ".pdf":
-        file_reader = PdfReader(file)
-        for page in file_reader.pages:
+# ----------- File Processing -----------
+def extract_text_from_pdf(file):
+    """Extract text from PDF using PyPDF2 and OCR fallback with pdf2image + Tesseract."""
+    text = ""
+    try:
+        pdf_reader = PdfReader(file)
+        for page in pdf_reader.pages:
             page_text = page.extract_text()
             if page_text:
-                ext_text += page_text
-    elif file_extension.lower() in [".jpeg", ".jpg", ".png"]:
-        image = Image.open(file)
-        ext_text = pytesseract.image_to_string(image)
-    else:
-        st.write(f"File '{file.name}' is not a supported format.")
-    return ext_text
+                text += page_text
+    except Exception:
+        text = ""
 
-def save_to_excel(table_data, file_name="extracted_data.xlsx"):
-    # Assuming table_data is a list of dictionaries or a similar structured format
-    df = pd.DataFrame(table_data)
-    df.to_excel(file_name, index=False)
-    # convert PDF into CSV
-    # tabula.convert_into(table_data, file_name, output_format="csv", pages='all')
-    return file_name
+    if not text.strip():
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file.read())
+            tmp_path = tmp.name
+        images = convert_from_path(tmp_path)
+        for img in images:
+            text += pytesseract.image_to_string(img)
+        os.remove(tmp_path)
 
-def convert_response_to_table_data(response):
-    # Split the response string into lines
-    lines = response.split('\n')
-    
-    # Initialize an empty list to store table data
-    table_data = []
+    return text.strip()
 
-    # Extract column names from the first line
-    columns = [col.strip() for col in lines[0].split('|') if col.strip()]
+def extract_text_from_image(file):
+    """Extract text from image using Tesseract."""
+    image = Image.open(file)
+    return pytesseract.image_to_string(image).strip()
 
-    # Iterate over the remaining lines to extract data
-    for line in lines[2:]:
-        # Split each line into values
-        values = [value.strip() for value in line.split('|') if value.strip()]
-        # Create a dictionary mapping column names to values for each row
-        row_data = dict(zip(columns, values))
-        # Append the row data to the table_data list
-        table_data.append(row_data)
-    return table_data
+# ----------- AI Chat -----------
+def chat_with_mistral(text, selected_fields, model="mistral-small-latest"):
+    prompt = f"""
+    Extract the following fields from the provided invoice/bill text: {', '.join(selected_fields)}.
+    Respond ONLY in strict JSON array of objects where each object represents one invoice.
+    Example format:
+    [
+      {{
+        "Invoice Number": "12345",
+        "Invoice Date": "2024-01-15",
+        "Company Name": "ABC Ltd",
+        ...
+      }}
+    ]
+    Text to extract from:
+    {text}
+    """
 
-def chat_with_groq(client, model, text):
-    prompt = f'''
-        Extract Invoice number, Invoice Date, Company Name, Company GST number, Customer Name, Customer GST number, 
-        Total Quantity of boxes and Total amount. Arrange these details in a table format with same column names 
-        and reply only with table (no need for anything else like explanations, etc..). 
-        Use information from the following text:
-        {text}
-    '''
-    
     completion = client.chat.completions.create(
         model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
     )
+
     return completion.choices[0].message.content
 
+def parse_response_to_table(response, selected_fields):
+    try:
+        data = json.loads(response)
+        if isinstance(data, dict):
+            data = [data]
+        df = pd.DataFrame(data)
+    except Exception:
+        st.warning("Failed to parse JSON properly, falling back to raw text parsing.")
+        lines = response.split("\n")
+        rows = []
+        for line in lines[1:]:
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+            if len(parts) == len(selected_fields):
+                rows.append(dict(zip(selected_fields, parts)))
+        df = pd.DataFrame(rows)
+    return df
+
+def save_file(df, file_format="excel"):
+    if file_format == "excel":
+        output_file = "extracted_data.xlsx"
+        df.to_excel(output_file, index=False)
+    else:
+        output_file = "extracted_data.csv"
+        df.to_csv(output_file, index=False)
+    return output_file
+
+# ----------- Streamlit UI -----------
 def main():
-    # Sidebar contents
-    with st.sidebar:
-        st.title('Excelify - Convert PDF/Images to Excel')
-        st.markdown('''
-        ## About
-        Explore Excelify, a cutting-edge tool revolutionizing document conversions. 
-        Instantly transform PDFs and images into editable Excel files, streamlining data extraction and analysis.
-        Simplify workflows and enhance productivity with our AI-powered solution, 
-        ensuring accuracy and efficiency in data management tasks.
-        ''')
-        st.write('Made with :sparkling_heart: by [StirPot](https://stirpot.in/).')
-        model = "llama3-8b-8192"
+    st.sidebar.title("Excelify - Convert PDF/Images to Excel")
+    st.sidebar.markdown("Made with ❤️ by [StirPot](https://stirpot.in/)")
 
-    st.header("Unlock Data: Convert PDFs/Images to Excel with Excelify", divider='rainbow')
+    st.header("📄 Excelify with Mistral: Extract Invoices/Bills into Excel/CSV")
 
-    file_option = st.radio('Select file upload option below:', ('Multiple', 'Single'), index=1, horizontal=True)
+    # Field selection
+    default_fields = ["Invoice Number", "Invoice Date", "Company Name", "Company GST Number",
+                      "Customer Name", "Customer GST Number", "Total Quantity", "Total Amount"]
+    selected_fields = st.multiselect("Select fields to extract:", default_fields, default=default_fields)
 
-    ext_text = ""
-    response = ""
+    file_option = st.radio("Upload Mode", ["Single", "Multiple"], index=0, horizontal=True)
 
-    # Upload file(s)
-    if file_option == 'Single':
-        file = st.file_uploader("Upload your file (pdf or image only) ", type=['pdf', 'jpeg', 'jpg', 'png'])
-        if file is not None:
-            ext_text = process_file(file)
-    #        st.write("Extracted Text:")
-    #        st.write(ext_text)
-            if ext_text and ext_text.strip():  # Ensure ext_text is not None and is not empty
-                response = chat_with_groq(client, model, ext_text)
-                st.write("AI Response:")
-                st.write(response)
-            else:
-                st.write("No text extracted from the file.")
-    elif file_option == 'Multiple':
-        multi_file = st.file_uploader("Upload your file(s) (pdf or image only) ", accept_multiple_files=True, type=['pdf', 'jpeg', 'jpg', 'png'])
-        if multi_file:
-            st.write(f"{len(multi_file)} file(s) uploaded:")
-            for file in multi_file:
-                ext_text += process_file(file)
-    #        st.write("Extracted Text:")
-    #        st.write(ext_text)
-            if ext_text and ext_text.strip():  # Ensure ext_text is not None and is not empty
-                response = chat_with_groq(client, model, ext_text)
-                st.write("AI Response:")
-                st.write(response)
-            else:
-                st.write("No text extracted from the files.")
+    all_text = ""
+    dfs = []
 
-    if response :
-        table_data = convert_response_to_table_data(response)
-        excel_file_name = save_to_excel(table_data)
-        st.markdown("#")
-        with open(excel_file_name, "rb") as file:
-            btn = st.download_button(
-                    label= "Download Excel file",
-                    data=file,
-                    file_name=excel_file_name,
-                    help="Download your converted data in Excel Format",
-                    type="primary",
-                    mime="text/csv"
-                )
-    # else:
-    #     st.write("No Response for Excel")
+    if file_option == "Single":
+        file = st.file_uploader("Upload your file (PDF/Image)", type=["pdf", "jpeg", "jpg", "png"])
+        if file:
+            ext_text = extract_text_from_pdf(file) if file.type == "application/pdf" else extract_text_from_image(file)
+            if ext_text:
+                response = chat_with_mistral(ext_text, selected_fields)
+                df = parse_response_to_table(response, selected_fields)
+                st.subheader("Preview Extracted Data")
+                st.dataframe(df)
+                dfs.append(df)
+    else:
+        files = st.file_uploader("Upload multiple files", accept_multiple_files=True, type=["pdf", "jpeg", "jpg", "png"])
+        if files:
+            for file in files:
+                st.write(f"Processing {file.name} ...")
+                ext_text = extract_text_from_pdf(file) if file.type == "application/pdf" else extract_text_from_image(file)
+                if ext_text:
+                    response = chat_with_mistral(ext_text, selected_fields)
+                    df = parse_response_to_table(response, selected_fields)
+                    dfs.append(df)
+            if dfs:
+                final_df = pd.concat(dfs, ignore_index=True)
+                st.subheader("Preview Extracted Data")
+                st.dataframe(final_df)
+                dfs = [final_df]
 
+    # Download buttons
+    if dfs:
+        final_df = dfs[0] if len(dfs) == 1 else pd.concat(dfs, ignore_index=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            excel_file = save_file(final_df, "excel")
+            with open(excel_file, "rb") as f:
+                st.download_button("Download Excel", f, file_name="extracted_data.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with col2:
+            csv_file = save_file(final_df, "csv")
+            with open(csv_file, "rb") as f:
+                st.download_button("Download CSV", f, file_name="extracted_data.csv", mime="text/csv")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
