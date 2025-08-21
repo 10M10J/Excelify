@@ -55,37 +55,25 @@ def extract_text_from_image(file):
 
 # ----------- AI Chat -----------
 def chat_with_mistral(text, selected_fields, model="mistral-small-latest"):
+    # Build dynamic prompt using user-selected + custom fields
+    fields_list = "\n".join([f"- {f}" for f in selected_fields])
+    example_json = "{\n" + ",\n".join([f'  "{f}": "value"' for f in selected_fields]) + "\n}"
+    
     prompt = f"""
-You are an information extraction system.
-
-Extract ONLY these fields from the given invoice text:
-- Invoice number
-- Invoice date
-- Company name
-- Company GST number
-- Customer name
-- Customer GST number
-- Total quantity of boxes
-- Total amount
-
-Return the result as **valid JSON only**, without explanations, markdown, or any extra text. 
-If data is missing, use null.
-
-Example:
-{{
-  "Invoice number": "12345",
-  "Invoice date": "2025-08-20",
-  "Company name": "ABC Pvt Ltd",
-  "Company GST number": "22AAAAA0000A1Z5",
-  "Customer name": "XYZ Enterprises",
-  "Customer GST number": null,
-  "Total quantity of boxes": "25",
-  "Total amount": "45000"
-}}
-
-Now extract from this text:
-{text}
-"""
+        You are an information extraction system.
+        
+        Extract ONLY these fields from the given invoice text:
+        {fields_list}
+        
+        Return the result as **valid JSON only**, without explanations, markdown, or any extra text. 
+        If data is missing, use null.
+        
+        Example:
+        {example_json}
+        
+        Now extract from this text:
+        {text}
+        """
 
     completion = client.chat.completions.create(
         model=model,
@@ -96,23 +84,34 @@ Now extract from this text:
     return completion.choices[0].message.content
 
 def parse_response_to_table(response, selected_fields):
-    try:
-        # Try to extract the first JSON object/array from the response
-        json_match = re.search(r"\{.*\}|\[.*\]", response, re.DOTALL)
-        if json_match:
-            response_clean = json_match.group(0).strip()
-            data = json.loads(response_clean)
-        else:
-            raise ValueError("No JSON found in response")
+    # Normalization helper (reuse the same one)
+    def normalize_field_name(name: str) -> str:
+        return " ".join(word.capitalize() for word in name.strip().split())
 
-        # Ensure list of dicts
+    try:
+        # Remove code fences if present
+        response_clean = re.sub(r"^```json|```$", "", response.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(response_clean)
+
         if isinstance(data, dict):
-            data = [data]
+            data = [data]  # wrap single object in list
+
         df = pd.DataFrame(data)
+
+        # --- Normalize column names to match selected_fields ---
+        col_map = {col: normalize_field_name(col) for col in df.columns}
+        df = df.rename(columns=col_map)
+
+        # Ensure DataFrame has all selected fields in order
+        for f in selected_fields:
+            if f not in df.columns:
+                df[f] = None
+        df = df[selected_fields]
+
         return df
 
     except Exception:
-        st.warning("⚠️ Failed to parse JSON properly, falling back to raw text parsing.")
+        st.warning("⚠️ Failed to parse JSON. Falling back to raw text parsing.")
         # Fallback: try to interpret as Markdown-like table
         lines = response.split("\n")
         rows = []
@@ -133,8 +132,10 @@ def save_file(df, file_format="excel"):
 
 # ----------- Streamlit UI -----------
 def main():
+    st.set_page_config(page_title="Exxelify - Convert PDF to Excel", page_icon="📄", layout="wide")
     st.sidebar.title("Excelify - Convert PDF/Images to Excel")
-    st.sidebar.markdown("Made with ❤️ by [StirPot](https://stirpot.in/)")
+    st.sidebar.caption("Explore Excelify, a cutting-edge tool revolutionizing document conversions. Instantly transform PDFs and images into editable Excel files, streamlining data extraction and analysis. Simplify workflows and enhance productivity with our AI-powered solution, ensuring accuracy and efficiency in data management tasks.")
+    st.sidebar.markdown("Made with ❤️ in India")
 
     st.header("📄 Excelify with Mistral: Extract Invoices/Bills into Excel/CSV")
 
@@ -142,6 +143,28 @@ def main():
     default_fields = ["Invoice Number", "Invoice Date", "Company Name", "Company GST Number",
                       "Customer Name", "Customer GST Number", "Total Quantity", "Total Amount"]
     selected_fields = st.multiselect("Select fields to extract:", default_fields, default=default_fields)
+
+    # Let user add custom fields
+    custom_fields_input = st.text_input("Add custom fields (comma separated):", "")
+
+    if custom_fields_input:
+        custom_fields = [f.strip() for f in custom_fields_input.split(",") if f.strip()]
+        selected_fields.extend(custom_fields)
+        selected_fields = list(dict.fromkeys(selected_fields))  # remove duplicates
+    
+    # --- Normalize fields ---
+    def normalize_field_name(name: str) -> str:
+        # Trim whitespace, lowercase everything, then capitalize each word
+        return " ".join(word.capitalize() for word in name.strip().split())
+    
+    # Apply normalization + deduplicate while preserving order
+    normalized_fields = []
+    for f in selected_fields:
+        nf = normalize_field_name(f)
+        if nf not in normalized_fields:
+            normalized_fields.append(nf)
+    
+    selected_fields = normalized_fields
 
     file_option = st.radio("Upload Mode", ["Single", "Multiple"], index=0, horizontal=True)
 
