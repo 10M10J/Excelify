@@ -56,30 +56,36 @@ def extract_text_from_image(file):
 # ----------- AI Chat -----------
 def chat_with_mistral(text, selected_fields, model="mistral-small-latest"):
     prompt = f"""
-    Extract the following fields from the provided invoice/bill text: {', '.join(selected_fields)}.
+You are an information extraction system.
 
-    Respond ONLY with valid JSON.
-    - Do not add explanations or extra text.
-    - Do not wrap in Markdown fences.
-    - Return an array of JSON objects, even if only one invoice is found.
+Extract ONLY these fields from the given invoice text:
+- Invoice number
+- Invoice date
+- Company name
+- Company GST number
+- Customer name
+- Customer GST number
+- Total quantity of boxes
+- Total amount
 
-    Example format:
-    [
-      {{
-        "Invoice Number": "12345",
-        "Invoice Date": "2024-01-15",
-        "Company Name": "ABC Ltd",
-        "Company GST Number": "22ABCDE1234F1Z5",
-        "Customer Name": "XYZ Pvt Ltd",
-        "Customer GST Number": "27XYZDE6789F1Z5",
-        "Total Quantity": "10",
-        "Total Amount": "15000"
-      }}
-    ]
+Return the result as **valid JSON only**, without explanations, markdown, or any extra text. 
+If data is missing, use null.
 
-    Text to extract from:
-    {text}
-    """
+Example:
+{{
+  "Invoice number": "12345",
+  "Invoice date": "2025-08-20",
+  "Company name": "ABC Pvt Ltd",
+  "Company GST number": "22AAAAA0000A1Z5",
+  "Customer name": "XYZ Enterprises",
+  "Customer GST number": null,
+  "Total quantity of boxes": "25",
+  "Total amount": "45000"
+}}
+
+Now extract from this text:
+{text}
+"""
 
     completion = client.chat.completions.create(
         model=model,
@@ -90,18 +96,23 @@ def chat_with_mistral(text, selected_fields, model="mistral-small-latest"):
     return completion.choices[0].message.content
 
 def parse_response_to_table(response, selected_fields):
-    # Try JSON parsing first
     try:
-        # Remove code fences if present
-        response_clean = re.sub(r"^```json|```$", "", response.strip(), flags=re.MULTILINE).strip()
-        data = json.loads(response_clean)
+        # Try to extract the first JSON object/array from the response
+        json_match = re.search(r"\{.*\}|\[.*\]", response, re.DOTALL)
+        if json_match:
+            response_clean = json_match.group(0).strip()
+            data = json.loads(response_clean)
+        else:
+            raise ValueError("No JSON found in response")
 
+        # Ensure list of dicts
         if isinstance(data, dict):
-            data = [data]  # wrap single object in list
+            data = [data]
         df = pd.DataFrame(data)
         return df
+
     except Exception:
-        st.warning("⚠️ Failed to parse JSON. Falling back to raw text parsing.")
+        st.warning("⚠️ Failed to parse JSON properly, falling back to raw text parsing.")
         # Fallback: try to interpret as Markdown-like table
         lines = response.split("\n")
         rows = []
